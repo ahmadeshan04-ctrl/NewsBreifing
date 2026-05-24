@@ -153,11 +153,11 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"Missing required environment variables / GitHub secrets: {', '.join(missing)}")
 
-    anthropic_key = os.environ["ANTHROPIC_API_KEY"]
-    gmail_address = os.environ["GMAIL_ADDRESS"]
-    gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
-    recipient_email = os.environ.get("RECIPIENT_EMAIL", gmail_address)
-    recipient_name = os.environ.get("RECIPIENT_NAME", "")
+    anthropic_key = os.environ["ANTHROPIC_API_KEY"].strip()
+    gmail_address = os.environ["GMAIL_ADDRESS"].strip()
+    gmail_app_password = os.environ["GMAIL_APP_PASSWORD"].strip()
+    recipient_email = os.environ.get("RECIPIENT_EMAIL", gmail_address).strip()
+    recipient_name = os.environ.get("RECIPIENT_NAME", "").strip()
 
     print("Fetching market & business news...")
     market_articles = fetch_from_feeds(MARKET_FEEDS)
