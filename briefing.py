@@ -2,7 +2,7 @@
 
 import os
 import smtplib
-import requests
+import feedparser
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -12,37 +12,44 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+MARKET_FEEDS = [
+    ("BBC Business",  "http://feeds.bbci.co.uk/news/business/rss.xml"),
+    ("MarketWatch",   "https://feeds.marketwatch.com/marketwatch/topstories/"),
+    ("CNBC Finance",  "https://www.cnbc.com/id/10001147/device/rss/rss.html"),
+]
 
-def fetch_news(api_key: str, category: str, query: str | None = None, page_size: int = 12) -> list[dict]:
-    params = {
-        "language": "en",
-        "pageSize": page_size,
-        "apiKey": api_key,
-    }
-    if query:
-        url = "https://newsapi.org/v2/everything"
-        params["q"] = query
-        params["sortBy"] = "publishedAt"
-    else:
-        url = "https://newsapi.org/v2/top-headlines"
-        params["category"] = category
-        params["country"] = "us"
+POLITICAL_FEEDS = [
+    ("BBC World",     "http://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("NPR Politics",  "https://feeds.npr.org/1014/rss.xml"),
+    ("BBC Politics",  "http://feeds.bbci.co.uk/news/politics/rss.xml"),
+]
 
-    response = requests.get(url, params=params, timeout=15)
-    response.raise_for_status()
-    articles = response.json().get("articles", [])
-    # Filter out removed articles
-    return [a for a in articles if a.get("title") and a["title"] != "[Removed]"]
+
+def fetch_from_feeds(feeds: list[tuple[str, str]], limit_per_feed: int = 6) -> list[dict]:
+    articles = []
+    for source_name, url in feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:limit_per_feed]:
+                title = entry.get("title", "").strip()
+                if not title:
+                    continue
+                summary = (entry.get("summary") or entry.get("description") or "").strip()
+                # feedparser sometimes wraps summary in HTML tags — strip them crudely
+                summary = summary.replace("<p>", "").replace("</p>", "").strip()
+                articles.append({"source": source_name, "title": title, "description": summary})
+        except Exception as e:
+            print(f"  Warning: could not fetch {source_name} ({url}): {e}")
+    return articles
 
 
 def format_articles_for_prompt(articles: list[dict]) -> str:
     lines = []
     for i, article in enumerate(articles, 1):
-        title = article.get("title", "").strip()
-        desc = (article.get("description") or "").strip()
-        source = article.get("source", {}).get("name", "Unknown")
-        lines.append(f"{i}. [{source}] {title}")
-        if desc:
+        lines.append(f"{i}. [{article['source']}] {article['title']}")
+        if article.get("description"):
+            # Trim very long summaries
+            desc = article["description"][:300]
             lines.append(f"   {desc}")
     return "\n".join(lines)
 
@@ -118,7 +125,7 @@ def build_email_html(briefing_content: str, recipient_name: str = "") -> str:
         <!-- Footer -->
         <tr><td style="background-color:#f8f9fa;border:1px solid #d1d5db;border-top:none;border-radius:0 0 8px 8px;padding:16px 36px;text-align:center;">
           <p style="margin:0;font-size:11px;color:#9ca3af;letter-spacing:0.3px;">
-            Automated Morning Briefing &middot; Powered by Claude AI &amp; NewsAPI &middot; {today}
+            Automated Morning Briefing &middot; Powered by Claude AI &middot; {today}
           </p>
         </td></tr>
 
@@ -143,23 +150,21 @@ def send_email(html: str, subject: str, sender: str, password: str, recipient: s
 
 def main() -> None:
     anthropic_key = os.environ["ANTHROPIC_API_KEY"]
-    newsapi_key = os.environ["NEWSAPI_KEY"]
     gmail_address = os.environ["GMAIL_ADDRESS"]
     gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
     recipient_email = os.environ.get("RECIPIENT_EMAIL", gmail_address)
     recipient_name = os.environ.get("RECIPIENT_NAME", "")
 
     print("Fetching market & business news...")
-    market_articles = fetch_news(newsapi_key, category="business")
+    market_articles = fetch_from_feeds(MARKET_FEEDS)
 
     print("Fetching political & world news...")
-    # Mix top-headlines general + targeted query for broader political coverage
-    political_articles = fetch_news(newsapi_key, category="general")
+    political_articles = fetch_from_feeds(POLITICAL_FEEDS)
 
     print(f"  Market articles: {len(market_articles)}, Political articles: {len(political_articles)}")
 
     if not market_articles and not political_articles:
-        raise RuntimeError("No articles fetched — check your NEWSAPI_KEY and quota.")
+        raise RuntimeError("No articles fetched — all RSS feeds failed. Check network access.")
 
     print("Generating briefing with Claude...")
     client = Anthropic(api_key=anthropic_key)
