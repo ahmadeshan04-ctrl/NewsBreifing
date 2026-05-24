@@ -149,6 +149,10 @@ def send_email(html: str, subject: str, sender: str, password: str, recipient: s
 
 
 def main() -> None:
+    missing = [v for v in ("ANTHROPIC_API_KEY", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD") if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables / GitHub secrets: {', '.join(missing)}")
+
     anthropic_key = os.environ["ANTHROPIC_API_KEY"]
     gmail_address = os.environ["GMAIL_ADDRESS"]
     gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
