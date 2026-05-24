@@ -1,0 +1,39 @@
+name: Daily Morning Briefing
+
+on:
+  schedule:
+    # 7:00 AM UTC = 3:00 AM ET / 8:00 AM BST
+    # Adjust the hour to match your timezone:
+    #   ET (UTC-5):  12 = 7am ET   | 11 = 6am ET
+    #   BST (UTC+1): 6  = 7am BST
+    #   GST (UTC+4): 3  = 7am GST
+    - cron: '0 7 * * 1-5'   # weekdays only — change to '* * *' for every day
+  workflow_dispatch:          # lets you trigger it manually from GitHub Actions UI
+
+jobs:
+  send-briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send morning briefing
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          RECIPIENT_NAME: ${{ secrets.RECIPIENT_NAME }}
+        run: python briefing.py
