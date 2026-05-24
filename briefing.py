@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import smtplib
 import feedparser
 from datetime import datetime
@@ -153,10 +154,13 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"Missing required environment variables / GitHub secrets: {', '.join(missing)}")
 
+    def clean_email(val: str) -> str:
+        return re.sub(r'\s+', '', val)
+
     anthropic_key = os.environ["ANTHROPIC_API_KEY"].strip()
-    gmail_address = os.environ["GMAIL_ADDRESS"].strip()
+    gmail_address = clean_email(os.environ["GMAIL_ADDRESS"])
     gmail_app_password = os.environ["GMAIL_APP_PASSWORD"].strip()
-    recipient_email = os.environ.get("RECIPIENT_EMAIL", gmail_address).strip()
+    recipient_email = clean_email(os.environ.get("RECIPIENT_EMAIL", gmail_address))
     recipient_name = os.environ.get("RECIPIENT_NAME", "").strip()
 
     print("Fetching market & business news...")
