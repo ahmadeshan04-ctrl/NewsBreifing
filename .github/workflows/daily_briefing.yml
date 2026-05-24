@@ -2,12 +2,9 @@ name: Daily Morning Briefing
 
 on:
   schedule:
-    # 7:00 AM UTC = 3:00 AM ET / 8:00 AM BST
-    # Adjust the hour to match your timezone:
-    #   ET (UTC-5):  12 = 7am ET   | 11 = 6am ET
-    #   BST (UTC+1): 6  = 7am BST
-    #   GST (UTC+4): 3  = 7am GST
-    - cron: '0 7 * * 1-5'   # weekdays only — change to '* * *' for every day
+    # 13:00 UTC = 8:00 AM EST (winter) / 9:00 AM EDT (summer)
+    # GitHub Actions cron doesn't adjust for DST — this keeps it close to 8am ET year-round
+    - cron: '0 13 * * *'
   workflow_dispatch:          # lets you trigger it manually from GitHub Actions UI
 
 env:
