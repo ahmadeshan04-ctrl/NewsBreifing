@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import email as email_lib
+import html as html_lib
+import imaplib
 import os
 import re
 import smtplib
 import feedparser
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -65,6 +68,73 @@ def fetch_from_feeds(feeds: list[tuple[str, str]], limit_per_feed: int = 6) -> l
     return articles
 
 
+def fetch_wsj_newsletter(gmail_address: str, gmail_app_password: str, lookback_days: int = 3) -> str:
+    """Fetch the most recent WSJ 10-Point newsletter email via IMAP.
+
+    Assumes the newsletter either arrives at, or is forwarded to, this same
+    Gmail inbox. Returns the extracted body text, or "" if nothing was found
+    (e.g. weekends, when WSJ doesn't send it, or forwarding isn't set up yet).
+    """
+    try:
+        imap = imaplib.IMAP4_SSL("imap.gmail.com")
+        imap.login(gmail_address, gmail_app_password)
+        imap.select("INBOX")
+
+        since_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
+        status, data = imap.search(None, f'(SINCE "{since_date}" SUBJECT "10-Point")')
+        if status != "OK" or not data[0]:
+            imap.logout()
+            return ""
+
+        latest_id = data[0].split()[-1]
+        # BODY.PEEK avoids marking the email as read in your inbox
+        status, msg_data = imap.fetch(latest_id, "(BODY.PEEK[])")
+        imap.logout()
+        if status != "OK" or not msg_data or not msg_data[0]:
+            return ""
+
+        msg = email_lib.message_from_bytes(msg_data[0][1])
+        return _extract_email_text(msg)
+    except Exception as e:
+        print(f"  Warning: could not fetch WSJ 10-Point newsletter: {e}")
+        return ""
+
+
+def _extract_email_text(msg: email_lib.message.Message) -> str:
+    """Pull readable text out of an email message, preferring text/plain."""
+    body_plain, body_html = None, None
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype == "text/plain" and body_plain is None:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body_plain = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+            elif ctype == "text/html" and body_html is None:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body_html = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            text = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+            if msg.get_content_type() == "text/html":
+                body_html = text
+            else:
+                body_plain = text
+
+    text = body_plain
+    if not text and body_html:
+        text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", body_html, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html_lib.unescape(text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n", text).strip()
+
+    return (text or "").strip()[:6000]
+
+
 def format_articles_for_prompt(articles: list[dict]) -> str:
     lines = []
     for i, article in enumerate(articles, 1):
@@ -79,6 +149,7 @@ def format_articles_for_prompt(articles: list[dict]) -> str:
 def generate_briefing(
     client: Anthropic,
     wsj_articles: list[dict],
+    wsj_newsletter_text: str,
     finance_articles: list[dict],
     healthcare_articles: list[dict],
     restructuring_articles: list[dict],
@@ -89,10 +160,16 @@ def generate_briefing(
     healthcare_text = format_articles_for_prompt(healthcare_articles)
     restructuring_text = format_articles_for_prompt(restructuring_articles)
 
+    newsletter_block = (
+        f"\n\nWSJ 10-POINT NEWSLETTER (forwarded email, use for additional analysis/color):\n{wsj_newsletter_text}"
+        if wsj_newsletter_text
+        else ""
+    )
+
     prompt = f"""Today is {today}. You are writing a sharp, professional morning briefing email for a financially-aware reader.
 
 WSJ MARKET HEADLINES:
-{wsj_text}
+{wsj_text}{newsletter_block}
 
 GENERAL FINANCE HEADLINES:
 {finance_text}
@@ -203,6 +280,10 @@ def main() -> None:
     print("Fetching WSJ market news...")
     wsj_articles = fetch_from_feeds(WSJ_FEEDS)
 
+    print("Fetching WSJ 10-Point newsletter from email...")
+    wsj_newsletter_text = fetch_wsj_newsletter(gmail_address, gmail_app_password)
+    print("  Found WSJ 10-Point email." if wsj_newsletter_text else "  No WSJ 10-Point email found for today.")
+
     print("Fetching general finance news...")
     finance_articles = fetch_from_feeds(FINANCE_FEEDS)
 
@@ -217,13 +298,13 @@ def main() -> None:
         f"Healthcare: {len(healthcare_articles)}, Restructuring: {len(restructuring_articles)}"
     )
 
-    if not any([wsj_articles, finance_articles, healthcare_articles, restructuring_articles]):
+    if not any([wsj_articles, finance_articles, healthcare_articles, restructuring_articles, wsj_newsletter_text]):
         raise RuntimeError("No articles fetched — all RSS feeds failed. Check network access.")
 
     print("Generating briefing with Claude...")
     client = Anthropic(api_key=anthropic_key)
     briefing_content = generate_briefing(
-        client, wsj_articles, finance_articles, healthcare_articles, restructuring_articles
+        client, wsj_articles, wsj_newsletter_text, finance_articles, healthcare_articles, restructuring_articles
     )
 
     today_short = datetime.now().strftime("%A, %B %d")
