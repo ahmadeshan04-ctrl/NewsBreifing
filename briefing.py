@@ -5,6 +5,7 @@ import re
 import smtplib
 import feedparser
 from datetime import datetime
+from urllib.parse import quote
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -13,16 +14,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MARKET_FEEDS = [
+WSJ_FEEDS = [
+    ("WSJ Markets",   "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+]
+
+FINANCE_FEEDS = [
     ("BBC Business",  "http://feeds.bbci.co.uk/news/business/rss.xml"),
     ("MarketWatch",   "https://feeds.marketwatch.com/marketwatch/topstories/"),
     ("CNBC Finance",  "https://www.cnbc.com/id/10001147/device/rss/rss.html"),
+    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
 ]
 
-POLITICAL_FEEDS = [
-    ("BBC World",     "http://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("NPR Politics",  "https://feeds.npr.org/1014/rss.xml"),
-    ("BBC Politics",  "http://feeds.bbci.co.uk/news/politics/rss.xml"),
+HEALTHCARE_FEEDS = [
+    ("STAT News",         "https://www.statnews.com/feed/"),
+    ("Fierce Healthcare", "https://www.fiercehealthcare.com/rss.xml"),
+    ("Healthcare Dive",   "https://www.healthcaredive.com/feeds/news/"),
+]
+
+# The restructuring-consulting firms (EY-Parthenon, Alvarez & Marsal, FTI
+# Consulting, AlixPartners) don't publish their own deal RSS feeds, so this
+# uses a Google News search feed scoped to those firm names instead.
+RESTRUCTURING_QUERY = (
+    '"Alvarez & Marsal" OR "AlixPartners" OR "FTI Consulting" OR "EY-Parthenon" restructuring'
+)
+RESTRUCTURING_FEEDS = [
+    (
+        "Restructuring Deals",
+        "https://news.google.com/rss/search?q="
+        + quote(RESTRUCTURING_QUERY)
+        + "&hl=en-US&gl=US&ceid=US:en",
+    ),
 ]
 
 
@@ -55,23 +76,39 @@ def format_articles_for_prompt(articles: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def generate_briefing(client: Anthropic, market_articles: list[dict], political_articles: list[dict]) -> str:
+def generate_briefing(
+    client: Anthropic,
+    wsj_articles: list[dict],
+    finance_articles: list[dict],
+    healthcare_articles: list[dict],
+    restructuring_articles: list[dict],
+) -> str:
     today = datetime.now().strftime("%A, %B %d, %Y")
-    market_text = format_articles_for_prompt(market_articles)
-    political_text = format_articles_for_prompt(political_articles)
+    wsj_text = format_articles_for_prompt(wsj_articles)
+    finance_text = format_articles_for_prompt(finance_articles)
+    healthcare_text = format_articles_for_prompt(healthcare_articles)
+    restructuring_text = format_articles_for_prompt(restructuring_articles)
 
     prompt = f"""Today is {today}. You are writing a sharp, professional morning briefing email for a financially-aware reader.
 
-MARKET & BUSINESS HEADLINES:
-{market_text}
+WSJ MARKET HEADLINES:
+{wsj_text}
 
-POLITICAL & WORLD HEADLINES:
-{political_text}
+GENERAL FINANCE HEADLINES:
+{finance_text}
 
-Write a morning briefing with exactly two sections. For each section pick the 3–5 most significant stories and write 2–3 sentences per story: what happened, why it matters, and what to watch.
+HEALTHCARE SECTOR HEADLINES:
+{healthcare_text}
 
-Section 1 — MARKETS: Focus on macro moves, earnings, commodity prices (oil, gold), Fed/central bank signals, major IPOs or M&A, geopolitical impacts on markets.
-Section 2 — POLITICS: Cover the most consequential domestic or international political developments and their real-world implications.
+RESTRUCTURING CONSULTING HEADLINES (mentions of EY-Parthenon, Alvarez & Marsal, FTI Consulting, AlixPartners):
+{restructuring_text}
+
+Write a morning briefing with exactly four sections. For each section pick the 3–5 most significant stories and write 2–3 sentences per story: what happened, why it matters, and what to watch. If a section's headlines are thin or off-topic, cover fewer stories rather than padding — do not invent stories.
+
+Section 1 — WSJ MARKETS: Major market moves reported by the Wall Street Journal — indices, rates, commodities, Fed/central bank signals.
+Section 2 — FINANCE: Broader finance and business news of the day — earnings, M&A, corporate strategy, macro trends not already covered in Section 1.
+Section 3 — HEALTHCARE: What's happening in the healthcare sector — biotech, pharma, hospital systems, payers, regulation.
+Section 4 — RESTRUCTURING CONSULTING: Key deals, engagements, and moves at restructuring/turnaround advisory firms, especially EY-Parthenon, Alvarez & Marsal, FTI Consulting, and AlixPartners. If none of these firms appear by name, summarize the most relevant restructuring/turnaround deal news instead.
 
 Format strictly as HTML (no <html>/<head>/<body> tags). Use this structure:
 - <h2> for section headers
@@ -83,7 +120,7 @@ Open with a single <p><em>one-sentence overview of the overall tone of today's n
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=2500,
+        max_tokens=3500,
         messages=[{"role": "user", "content": prompt}],
     )
     return message.content[0].text
@@ -113,7 +150,7 @@ def build_email_html(briefing_content: str, recipient_name: str = "") -> str:
 
         <!-- Greeting bar -->
         <tr><td style="background-color:#1b2838;padding:14px 36px;border-left:1px solid #1e3a5f;border-right:1px solid #1e3a5f;">
-          <p style="margin:0;font-size:14px;font-style:italic;color:#a8b2bf;">{greeting} Here's what's moving the world today.</p>
+          <p style="margin:0;font-size:14px;font-style:italic;color:#a8b2bf;">{greeting} Here's what's moving markets, finance, healthcare, and restructuring today.</p>
         </td></tr>
 
         <!-- Body -->
@@ -163,20 +200,31 @@ def main() -> None:
     recipient_email = clean_email(os.environ.get("RECIPIENT_EMAIL", gmail_address))
     recipient_name = os.environ.get("RECIPIENT_NAME", "").strip()
 
-    print("Fetching market & business news...")
-    market_articles = fetch_from_feeds(MARKET_FEEDS)
+    print("Fetching WSJ market news...")
+    wsj_articles = fetch_from_feeds(WSJ_FEEDS)
 
-    print("Fetching political & world news...")
-    political_articles = fetch_from_feeds(POLITICAL_FEEDS)
+    print("Fetching general finance news...")
+    finance_articles = fetch_from_feeds(FINANCE_FEEDS)
 
-    print(f"  Market articles: {len(market_articles)}, Political articles: {len(political_articles)}")
+    print("Fetching healthcare sector news...")
+    healthcare_articles = fetch_from_feeds(HEALTHCARE_FEEDS)
 
-    if not market_articles and not political_articles:
+    print("Fetching restructuring consulting news...")
+    restructuring_articles = fetch_from_feeds(RESTRUCTURING_FEEDS)
+
+    print(
+        f"  WSJ: {len(wsj_articles)}, Finance: {len(finance_articles)}, "
+        f"Healthcare: {len(healthcare_articles)}, Restructuring: {len(restructuring_articles)}"
+    )
+
+    if not any([wsj_articles, finance_articles, healthcare_articles, restructuring_articles]):
         raise RuntimeError("No articles fetched — all RSS feeds failed. Check network access.")
 
     print("Generating briefing with Claude...")
     client = Anthropic(api_key=anthropic_key)
-    briefing_content = generate_briefing(client, market_articles, political_articles)
+    briefing_content = generate_briefing(
+        client, wsj_articles, finance_articles, healthcare_articles, restructuring_articles
+    )
 
     today_short = datetime.now().strftime("%A, %B %d")
     subject = f"Morning Briefing — {today_short}"
