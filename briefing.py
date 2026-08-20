@@ -34,34 +34,73 @@ HEALTHCARE_FEEDS = [
     ("Healthcare Dive",   "https://www.healthcaredive.com/feeds/news/"),
 ]
 
-# The restructuring-consulting firms (EY-Parthenon, Alvarez & Marsal, FTI
-# Consulting, AlixPartners) don't publish their own deal RSS feeds, so this
-# uses a Google News search feed scoped to those firm names instead.
-RESTRUCTURING_QUERY = (
-    '"Alvarez & Marsal" OR "AlixPartners" OR "FTI Consulting" OR "EY-Parthenon" restructuring'
-)
-RESTRUCTURING_FEEDS = [
-    (
-        "Restructuring Deals",
-        "https://news.google.com/rss/search?q="
-        + quote(RESTRUCTURING_QUERY)
-        + "&hl=en-US&gl=US&ceid=US:en",
-    ),
-]
+# The restructuring-consulting firms don't publish their own deal RSS feeds.
+# Google News' RSS entries link to a Google-hosted redirect page with no real
+# content, so this uses Bing News search instead — its RSS descriptions
+# contain actual deal detail (advisors, parties, deal terms), which is what
+# lets the briefing say something substantive about each firm's active deals.
+RESTRUCTURING_FIRMS = ["EY-Parthenon", "Alvarez & Marsal", "FTI Consulting", "AlixPartners"]
+
+# Bing's news search sometimes pads a quoted-phrase query with loosely related
+# "trending" stories that don't actually mention the firm — this is the
+# post-filter that catches those before they reach the prompt.
+RESTRUCTURING_FIRM_MATCH_TERMS = {
+    "EY-Parthenon": ["ey-parthenon", "ey parthenon"],
+    "Alvarez & Marsal": ["alvarez & marsal", "alvarez and marsal", "alvarez"],
+    "FTI Consulting": ["fti consulting"],
+    "AlixPartners": ["alixpartners", "alix partners"],
+}
+
+# Bing's `qft=interval="N"` scopes results by recency: 8 = past week, 9 = past
+# month. Try the narrower window first so the briefing stays current; widen
+# to a month only if a firm had too little coverage this week.
+def _restructuring_feed_url(firm: str, interval: int) -> str:
+    query = f'"{firm}" (restructuring OR bankruptcy OR turnaround OR "Chapter 11" OR advisory OR deal)'
+    return (
+        "https://www.bing.com/news/search?q="
+        + quote(query)
+        + f'&format=rss&qft=interval%3d%22{interval}%22'
+    )
+
+
+def _is_relevant_to_firm(article: dict, firm: str) -> bool:
+    haystack = (article["title"] + " " + article["description"]).lower()
+    return any(term in haystack for term in RESTRUCTURING_FIRM_MATCH_TERMS[firm])
+
+
+def fetch_restructuring_articles(firm: str, limit: int = 6) -> list[dict]:
+    """Fetch this firm's recent restructuring headlines, widening the lookback
+    window from a week to a month if the narrower window comes up too thin."""
+    for interval in (8, 9):
+        feed = [(firm, _restructuring_feed_url(firm, interval))]
+        articles = [a for a in fetch_from_feeds(feed, limit_per_feed=limit * 2) if _is_relevant_to_firm(a, firm)]
+        if articles:
+            return articles[:limit]
+    return []
+
+
+_FEED_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBriefingBot/1.0)"}
+
+
+def _strip_html(text: str) -> str:
+    """Strip tags/scripts from an HTML fragment and unescape entities."""
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
 
 
 def fetch_from_feeds(feeds: list[tuple[str, str]], limit_per_feed: int = 6) -> list[dict]:
     articles = []
     for source_name, url in feeds:
         try:
-            feed = feedparser.parse(url)
+            feed = feedparser.parse(url, request_headers=_FEED_REQUEST_HEADERS)
             for entry in feed.entries[:limit_per_feed]:
-                title = entry.get("title", "").strip()
+                title = _strip_html(entry.get("title", ""))
                 if not title:
                     continue
-                summary = (entry.get("summary") or entry.get("description") or "").strip()
-                # feedparser sometimes wraps summary in HTML tags — strip them crudely
-                summary = summary.replace("<p>", "").replace("</p>", "").strip()
+                summary = _strip_html(entry.get("summary") or entry.get("description") or "")
                 articles.append({"source": source_name, "title": title, "description": summary})
         except Exception as e:
             print(f"  Warning: could not fetch {source_name} ({url}): {e}")
@@ -124,15 +163,8 @@ def _extract_email_text(msg: email_lib.message.Message) -> str:
             else:
                 body_plain = text
 
-    text = body_plain
-    if not text and body_html:
-        text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", body_html, flags=re.S | re.I)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = html_lib.unescape(text)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n", text).strip()
-
-    return (text or "").strip()[:6000]
+    text = body_plain or (_strip_html(body_html) if body_html else "")
+    return text.strip()[:6000]
 
 
 def format_articles_for_prompt(articles: list[dict]) -> str:
@@ -146,30 +178,41 @@ def format_articles_for_prompt(articles: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def format_restructuring_for_prompt(articles_by_firm: dict[str, list[dict]]) -> str:
+    blocks = []
+    for firm, articles in articles_by_firm.items():
+        blocks.append(f"=== {firm} ===")
+        blocks.append(format_articles_for_prompt(articles) if articles else "(no recent headlines found)")
+    return "\n".join(blocks)
+
+
 def generate_briefing(
     client: Anthropic,
     wsj_articles: list[dict],
     wsj_newsletter_text: str,
     finance_articles: list[dict],
     healthcare_articles: list[dict],
-    restructuring_articles: list[dict],
+    restructuring_by_firm: dict[str, list[dict]],
 ) -> str:
     today = datetime.now().strftime("%A, %B %d, %Y")
     wsj_text = format_articles_for_prompt(wsj_articles)
     finance_text = format_articles_for_prompt(finance_articles)
     healthcare_text = format_articles_for_prompt(healthcare_articles)
-    restructuring_text = format_articles_for_prompt(restructuring_articles)
+    restructuring_text = format_restructuring_for_prompt(restructuring_by_firm)
 
-    newsletter_block = (
-        f"\n\nWSJ 10-POINT NEWSLETTER (forwarded email, use for additional analysis/color):\n{wsj_newsletter_text}"
+    newsletter_section = (
+        wsj_newsletter_text
         if wsj_newsletter_text
-        else ""
+        else "(No 10-Point email found today — skip this section with a single sentence noting it wasn't available.)"
     )
 
     prompt = f"""Today is {today}. You are writing a sharp, professional morning briefing email for a financially-aware reader.
 
-WSJ MARKET HEADLINES:
-{wsj_text}{newsletter_block}
+WSJ MARKET HEADLINES (from RSS):
+{wsj_text}
+
+WSJ 10-POINT NEWSLETTER CONTENT (forwarded email):
+{newsletter_section}
 
 GENERAL FINANCE HEADLINES:
 {finance_text}
@@ -177,19 +220,22 @@ GENERAL FINANCE HEADLINES:
 HEALTHCARE SECTOR HEADLINES:
 {healthcare_text}
 
-RESTRUCTURING CONSULTING HEADLINES (mentions of EY-Parthenon, Alvarez & Marsal, FTI Consulting, AlixPartners):
+RESTRUCTURING CONSULTING HEADLINES, grouped by firm:
 {restructuring_text}
 
-Write a morning briefing with exactly four sections. For each section pick the 3–5 most significant stories and write 2–3 sentences per story: what happened, why it matters, and what to watch. If a section's headlines are thin or off-topic, cover fewer stories rather than padding — do not invent stories.
+Write a morning briefing with exactly five sections, in this order. For sections 1, 3, and 4, pick the 3–5 most significant stories and write 2–3 sentences per story: what happened, why it matters, and what to watch. If a section's headlines are thin or off-topic, cover fewer stories rather than padding — do not invent stories.
+
+Throughout, prioritize concrete, specific facts over vague characterizations: name the companies, counterparties, dollar figures, deal structures, and dates whenever the source material provides them. The reader wants enough specificity to form their own opinion on a deal, not just a summary that something happened — if a number or name is available, use it; if it isn't, say what's unknown rather than glossing over it.
 
 Section 1 — WSJ MARKETS: Major market moves reported by the Wall Street Journal — indices, rates, commodities, Fed/central bank signals.
-Section 2 — FINANCE: Broader finance and business news of the day — earnings, M&A, corporate strategy, macro trends not already covered in Section 1.
-Section 3 — HEALTHCARE: What's happening in the healthcare sector — biotech, pharma, hospital systems, payers, regulation.
-Section 4 — RESTRUCTURING CONSULTING: Key deals, engagements, and moves at restructuring/turnaround advisory firms, especially EY-Parthenon, Alvarez & Marsal, FTI Consulting, and AlixPartners. If none of these firms appear by name, summarize the most relevant restructuring/turnaround deal news instead.
+Section 2 — WSJ 10-POINT: Summarize the newsletter content above in the same story-by-story style (skip stories already covered in Section 1).
+Section 3 — FINANCE: Broader finance and business news of the day — earnings, M&A, corporate strategy, macro trends not already covered above.
+Section 4 — HEALTHCARE: What's happening in the healthcare sector — biotech, pharma, hospital systems, payers, regulation.
+Section 5 — RESTRUCTURING CONSULTING: For EACH of the four firms — EY-Parthenon, Alvarez & Marsal, FTI Consulting, AlixPartners — write its own <h3> subsection naming the firm, followed by 2–3 short paragraphs covering: (a) the specific active deals or engagements in the headlines — who the client/counterparty is, what kind of mandate (restructuring, bankruptcy, M&A advisory, acquisition, senior hire), and any deal size or terms mentioned; (b) what's new or has changed versus what a reader would already know; and (c) why it's a meaningful data point about that firm's positioning (e.g. sector focus, deal flow momentum, competitive standing). If a firm has no usable headlines, write one sentence noting there's no notable update today rather than inventing a deal.
 
 Format strictly as HTML (no <html>/<head>/<body> tags). Use this structure:
 - <h2> for section headers
-- <h3 style="margin-bottom:4px"> for each story headline (keep it punchy, under 10 words)
+- <h3 style="margin-bottom:4px"> for each story headline or firm name (keep it punchy, under 10 words)
 - <p style="margin-top:4px"> for the analysis paragraph
 - Wrap any key figures/numbers in <strong>
 
@@ -197,7 +243,7 @@ Open with a single <p><em>one-sentence overview of the overall tone of today's n
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=3500,
+        max_tokens=4500,
         messages=[{"role": "user", "content": prompt}],
     )
     return message.content[0].text
@@ -290,21 +336,27 @@ def main() -> None:
     print("Fetching healthcare sector news...")
     healthcare_articles = fetch_from_feeds(HEALTHCARE_FEEDS)
 
-    print("Fetching restructuring consulting news...")
-    restructuring_articles = fetch_from_feeds(RESTRUCTURING_FEEDS)
+    print("Fetching restructuring consulting news, per firm...")
+    restructuring_by_firm = {firm: fetch_restructuring_articles(firm) for firm in RESTRUCTURING_FIRMS}
+    for firm, articles in restructuring_by_firm.items():
+        print(f"    {firm}: {len(articles)} headlines")
 
     print(
         f"  WSJ: {len(wsj_articles)}, Finance: {len(finance_articles)}, "
-        f"Healthcare: {len(healthcare_articles)}, Restructuring: {len(restructuring_articles)}"
+        f"Healthcare: {len(healthcare_articles)}, "
+        f"Restructuring: {sum(len(a) for a in restructuring_by_firm.values())}"
     )
 
-    if not any([wsj_articles, finance_articles, healthcare_articles, restructuring_articles, wsj_newsletter_text]):
+    if not any(
+        [wsj_articles, finance_articles, healthcare_articles, wsj_newsletter_text]
+        + list(restructuring_by_firm.values())
+    ):
         raise RuntimeError("No articles fetched — all RSS feeds failed. Check network access.")
 
     print("Generating briefing with Claude...")
     client = Anthropic(api_key=anthropic_key)
     briefing_content = generate_briefing(
-        client, wsj_articles, wsj_newsletter_text, finance_articles, healthcare_articles, restructuring_articles
+        client, wsj_articles, wsj_newsletter_text, finance_articles, healthcare_articles, restructuring_by_firm
     )
 
     today_short = datetime.now().strftime("%A, %B %d")
