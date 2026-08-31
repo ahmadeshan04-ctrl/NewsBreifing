@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import calendar
 import email as email_lib
 import html as html_lib
 import imaplib
@@ -7,7 +8,7 @@ import os
 import re
 import smtplib
 import feedparser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -17,15 +18,32 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-WSJ_FEEDS = [
-    ("WSJ Markets",   "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+# How recent an article has to be to reach the prompt. Kept tight for markets
+# (yesterday's index move is not today's news) and looser for the slower-moving
+# sector/deal beats.
+MARKET_MAX_AGE_DAYS = 3
+SECTOR_MAX_AGE_DAYS = 10
+RESTRUCTURING_MAX_AGE_DAYS = 21
+
+# If a feed's newest item is older than this, treat the whole feed as dead and
+# skip it — this is what stops an abandoned feed (e.g. the old WSJ RSS, frozen
+# since Jan 2025) from silently pinning a section to the same headlines forever.
+STALE_FEED_DAYS = 14
+
+# Broad market / macro coverage. WSJ's own RSS feeds (feeds.a.dj.com/*) were
+# abandoned in early 2025 and only ever return January 2025 headlines, so they
+# were removed; these are live and carry real article summaries to ground the
+# briefing.
+MARKET_FEEDS = [
+    ("CNBC Markets", "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
+    ("NPR Economy",  "https://feeds.npr.org/1017/rss.xml"),
+    ("BBC Business", "http://feeds.bbci.co.uk/news/business/rss.xml"),
 ]
 
 FINANCE_FEEDS = [
-    ("BBC Business",  "http://feeds.bbci.co.uk/news/business/rss.xml"),
-    ("MarketWatch",   "https://feeds.marketwatch.com/marketwatch/topstories/"),
+    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
     ("CNBC Finance",  "https://www.cnbc.com/id/10001147/device/rss/rss.html"),
-    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+    ("CNBC Business", "https://www.cnbc.com/id/10000115/device/rss/rss.html"),
 ]
 
 HEALTHCARE_FEEDS = [
@@ -34,49 +52,71 @@ HEALTHCARE_FEEDS = [
     ("Healthcare Dive",   "https://www.healthcaredive.com/feeds/news/"),
 ]
 
-# The restructuring-consulting firms don't publish their own deal RSS feeds.
-# Google News' RSS entries link to a Google-hosted redirect page with no real
-# content, so this uses Bing News search instead — its RSS descriptions
-# contain actual deal detail (advisors, parties, deal terms), which is what
-# lets the briefing say something substantive about each firm's active deals.
 RESTRUCTURING_FIRMS = ["EY-Parthenon", "Alvarez & Marsal", "FTI Consulting", "AlixPartners"]
 
-# Bing's news search sometimes pads a quoted-phrase query with loosely related
-# "trending" stories that don't actually mention the firm — this is the
-# post-filter that catches those before they reach the prompt.
+# Google News RSS is the source for per-firm coverage: it's reliably updated,
+# every entry carries a real publish date, and `when:Nd` scopes by recency.
+# Its entry "summary" is only a link, so the title is all the model gets — the
+# prompt is told not to infer deal specifics that aren't in the headline.
 RESTRUCTURING_FIRM_MATCH_TERMS = {
     "EY-Parthenon": ["ey-parthenon", "ey parthenon"],
-    "Alvarez & Marsal": ["alvarez & marsal", "alvarez and marsal", "alvarez"],
-    "FTI Consulting": ["fti consulting"],
+    "Alvarez & Marsal": ["alvarez & marsal", "alvarez and marsal", "alvarez marsal", "a&m"],
+    "FTI Consulting": ["fti consulting", "fti "],
     "AlixPartners": ["alixpartners", "alix partners"],
 }
 
-# Bing's `qft=interval="N"` scopes results by recency: 8 = past week, 9 = past
-# month. Try the narrower window first so the briefing stays current; widen
-# to a month only if a firm had too little coverage this week.
-def _restructuring_feed_url(firm: str, interval: int) -> str:
-    query = f'"{firm}" (restructuring OR bankruptcy OR turnaround OR "Chapter 11" OR advisory OR deal)'
+# A firm's name in a headline isn't enough — "Careers at EY", "Welcome Back
+# Spotlight", award announcements etc. all match. Require a substantive term too,
+# and drop the obvious non-news.
+_RESTRUCTURING_TOPIC_TERMS = [
+    "restructur", "bankrupt", "chapter 11", "chapter 7", "insolven", "turnaround",
+    "distress", "creditor", "liquidat", "administration", "receivership",
+    "advis", "mandate", "retained", "engaged", "acqui", "merger", "deal",
+    "hire", "hires", "appoint", "names ", "joins", "poach",
+]
+_RESTRUCTURING_EXCLUDE_TERMS = [
+    "careers at", "welcome back", "spotlight", "day in the life",
+    "best places to work", "wins award", "award for", "obituary",
+    # Algorithmic 13F / brokerage-filing and sell-side-rating spam that mentions
+    # a firm only as a ticker.
+    "buys new stake", "sells shares", "acquires shares", "acquires a new",
+    "shares purchased", "shares sold", "stake in", "position in", "holdings in",
+    "price target", "average rating", "equities analyst", "analysts' ratings",
+    "13f", "$fcn", "market cap", "short interest", "p/e ratio",
+]
+
+
+def _restructuring_feed_url(firm: str) -> str:
+    query = (
+        f'"{firm}" (restructuring OR bankruptcy OR turnaround OR "Chapter 11" '
+        f'OR creditors OR distressed OR advisory OR mandate OR hire) '
+        f'when:{RESTRUCTURING_MAX_AGE_DAYS}d'
+    )
     return (
-        "https://www.bing.com/news/search?q="
+        "https://news.google.com/rss/search?q="
         + quote(query)
-        + f'&format=rss&qft=interval%3d%22{interval}%22'
+        + "&hl=en-US&gl=US&ceid=US:en"
     )
 
 
 def _is_relevant_to_firm(article: dict, firm: str) -> bool:
     haystack = (article["title"] + " " + article["description"]).lower()
-    return any(term in haystack for term in RESTRUCTURING_FIRM_MATCH_TERMS[firm])
+    if not any(term in haystack for term in RESTRUCTURING_FIRM_MATCH_TERMS[firm]):
+        return False
+    if any(term in haystack for term in _RESTRUCTURING_EXCLUDE_TERMS):
+        return False
+    return any(term in haystack for term in _RESTRUCTURING_TOPIC_TERMS)
 
 
 def fetch_restructuring_articles(firm: str, limit: int = 6) -> list[dict]:
-    """Fetch this firm's recent restructuring headlines, widening the lookback
-    window from a week to a month if the narrower window comes up too thin."""
-    for interval in (8, 9):
-        feed = [(firm, _restructuring_feed_url(firm, interval))]
-        articles = [a for a in fetch_from_feeds(feed, limit_per_feed=limit * 2) if _is_relevant_to_firm(a, firm)]
-        if articles:
-            return articles[:limit]
-    return []
+    """Fetch this firm's recent restructuring/deal headlines from Google News."""
+    feed = [(firm, _restructuring_feed_url(firm))]
+    articles = fetch_from_feeds(
+        feed, limit_per_feed=limit * 4, max_age_days=RESTRUCTURING_MAX_AGE_DAYS,
+        stale_check=False,
+    )
+    articles = [a for a in articles if _is_relevant_to_firm(a, firm)]
+    return articles[:limit]
 
 
 _FEED_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBriefingBot/1.0)"}
@@ -91,20 +131,84 @@ def _strip_html(text: str) -> str:
     return re.sub(r"\n\s*\n+", "\n", text).strip()
 
 
-def fetch_from_feeds(feeds: list[tuple[str, str]], limit_per_feed: int = 6) -> list[dict]:
+def _entry_datetime(entry) -> datetime | None:
+    """UTC datetime for a feed entry, or None if it carries no usable date."""
+    for key in ("published_parsed", "updated_parsed"):
+        parsed = entry.get(key)
+        if parsed:
+            return datetime.fromtimestamp(calendar.timegm(parsed), tz=timezone.utc)
+    return None
+
+
+def fetch_from_feeds(
+    feeds: list[tuple[str, str]],
+    limit_per_feed: int = 6,
+    max_age_days: int | None = None,
+    stale_check: bool = True,
+) -> list[dict]:
+    """Fetch and normalize entries from a list of (name, url) feeds.
+
+    Entries older than `max_age_days` are dropped. With `stale_check`, a feed
+    whose newest entry is older than STALE_FEED_DAYS is skipped entirely and
+    reported — the guard against abandoned feeds quietly freezing a section.
+    (Turn it off for search feeds, where a genuinely quiet topic looks the same
+    as a dead feed.)
+    """
+    now = datetime.now(timezone.utc)
     articles = []
     for source_name, url in feeds:
         try:
             feed = feedparser.parse(url, request_headers=_FEED_REQUEST_HEADERS)
-            for entry in feed.entries[:limit_per_feed]:
+            dated = [(_entry_datetime(e), e) for e in feed.entries]
+            newest = max((d for d, _ in dated if d), default=None)
+            if stale_check and newest and (now - newest).days > STALE_FEED_DAYS:
+                print(
+                    f"  Warning: {source_name} looks stale — newest item is "
+                    f"{(now - newest).days} days old ({url}); skipping feed."
+                )
+                continue
+
+            kept = 0
+            for entry_dt, entry in dated:
+                if kept >= limit_per_feed:
+                    break
+                if max_age_days is not None and entry_dt and (now - entry_dt).days > max_age_days:
+                    continue
                 title = _strip_html(entry.get("title", ""))
                 if not title:
                     continue
                 summary = _strip_html(entry.get("summary") or entry.get("description") or "")
-                articles.append({"source": source_name, "title": title, "description": summary})
+                # Some feeds (Google News especially) just echo the headline as
+                # the summary — that adds nothing and inflates the prompt.
+                norm = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+                if norm(summary)[:60] == norm(title)[:60]:
+                    summary = ""
+                articles.append({
+                    "source": source_name,
+                    "title": title,
+                    "description": summary,
+                    "date": entry_dt.strftime("%b %d") if entry_dt else "",
+                })
+                kept += 1
         except Exception as e:
             print(f"  Warning: could not fetch {source_name} ({url}): {e}")
     return articles
+
+
+def _dedupe_articles(*pools: list[dict]) -> None:
+    """Drop articles whose title already appeared in an earlier pool, in place —
+    so the same story isn't fed to (and written up in) two sections."""
+    seen: set[str] = set()
+    for pool in pools:
+        kept = []
+        for article in pool:
+            key = re.sub(r"[^a-z0-9]+", " ", article["title"].lower()).strip()
+            key = " ".join(key.split()[:12])
+            if key and key in seen:
+                continue
+            seen.add(key)
+            kept.append(article)
+        pool[:] = kept
 
 
 def fetch_wsj_newsletter(gmail_address: str, gmail_app_password: str, lookback_days: int = 3) -> str:
@@ -119,7 +223,7 @@ def fetch_wsj_newsletter(gmail_address: str, gmail_app_password: str, lookback_d
         imap.login(gmail_address, gmail_app_password)
         imap.select("INBOX")
 
-        since_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
+        since_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
         status, data = imap.search(None, f'(SINCE "{since_date}" SUBJECT "10-Point")')
         if status != "OK" or not data[0]:
             imap.logout()
@@ -168,12 +272,15 @@ def _extract_email_text(msg: email_lib.message.Message) -> str:
 
 
 def format_articles_for_prompt(articles: list[dict]) -> str:
+    if not articles:
+        return "(no headlines available)"
     lines = []
     for i, article in enumerate(articles, 1):
-        lines.append(f"{i}. [{article['source']}] {article['title']}")
+        date = f", {article['date']}" if article.get("date") else ""
+        lines.append(f"{i}. [{article['source']}{date}] {article['title']}")
         if article.get("description"):
             # Trim very long summaries
-            desc = article["description"][:300]
+            desc = article["description"][:400]
             lines.append(f"   {desc}")
     return "\n".join(lines)
 
@@ -182,20 +289,24 @@ def format_restructuring_for_prompt(articles_by_firm: dict[str, list[dict]]) -> 
     blocks = []
     for firm, articles in articles_by_firm.items():
         blocks.append(f"=== {firm} ===")
-        blocks.append(format_articles_for_prompt(articles) if articles else "(no recent headlines found)")
+        blocks.append(
+            format_articles_for_prompt(articles)
+            if articles
+            else "(no relevant headlines in the past few weeks)"
+        )
     return "\n".join(blocks)
 
 
 def generate_briefing(
     client: Anthropic,
-    wsj_articles: list[dict],
+    market_articles: list[dict],
     wsj_newsletter_text: str,
     finance_articles: list[dict],
     healthcare_articles: list[dict],
     restructuring_by_firm: dict[str, list[dict]],
 ) -> str:
-    today = datetime.now().strftime("%A, %B %d, %Y")
-    wsj_text = format_articles_for_prompt(wsj_articles)
+    today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+    market_text = format_articles_for_prompt(market_articles)
     finance_text = format_articles_for_prompt(finance_articles)
     healthcare_text = format_articles_for_prompt(healthcare_articles)
     restructuring_text = format_restructuring_for_prompt(restructuring_by_firm)
@@ -208,8 +319,16 @@ def generate_briefing(
 
     prompt = f"""Today is {today}. You are writing a sharp, professional morning briefing email for a financially-aware reader.
 
-WSJ MARKET HEADLINES (from RSS):
-{wsj_text}
+Every headline below is tagged with its source and publish date, e.g. [CNBC Markets, Aug 28]. Work only from the material provided here.
+
+GROUND RULES — follow these exactly:
+- Use only facts that appear in the headlines and summaries below. Do NOT add company names, ticker symbols, dollar figures, percentages, counterparties, dates, or deal terms that are not explicitly present in the source text. If a detail a reader would want is not in the source, say it wasn't disclosed rather than filling it in.
+- Respect the dates. Today is {today}. Never describe something dated days ago as if it happened "today" or "this morning" — say "on Aug 28" or "this week". If the freshest item in a section is several days old, open that section by saying it's a quiet news day for that beat.
+- If a section's material is missing, thin, or off-topic, cover fewer stories — or say there's nothing material to report. Padding a section with generic commentary is worse than a short section.
+- No outside knowledge, no forecasts of specific numbers, no invented quotes.
+
+MARKET / MACRO HEADLINES:
+{market_text}
 
 WSJ 10-POINT NEWSLETTER CONTENT (forwarded email):
 {newsletter_section}
@@ -220,37 +339,36 @@ GENERAL FINANCE HEADLINES:
 HEALTHCARE SECTOR HEADLINES:
 {healthcare_text}
 
-RESTRUCTURING CONSULTING HEADLINES, grouped by firm:
+RESTRUCTURING / DEAL HEADLINES for four consulting firms (Google News; headline only, no summary text — do not infer specifics beyond what the headline says):
 {restructuring_text}
 
-Write a morning briefing with exactly five sections, in this order. For sections 1, 3, and 4, pick the 3–5 most significant stories and write 2–3 sentences per story: what happened, why it matters, and what to watch. If a section's headlines are thin or off-topic, cover fewer stories rather than padding — do not invent stories.
+Write a morning briefing with exactly five sections, in this order. For sections 1, 3, and 4, pick the 3–5 most significant stories and write 2–3 sentences each: what happened (with the date), why it matters, what to watch.
 
-Throughout, prioritize concrete, specific facts over vague characterizations: name the companies, counterparties, dollar figures, deal structures, and dates whenever the source material provides them. The reader wants enough specificity to form their own opinion on a deal, not just a summary that something happened — if a number or name is available, use it; if it isn't, say what's unknown rather than glossing over it.
+Section 1 — MARKETS & MACRO: Index moves, rates, commodities, the Fed and other central banks, economic data.
+Section 2 — WSJ 10-POINT: Summarize the newsletter content above story by story (skip anything already covered in Section 1). If no newsletter text was provided, note that in one sentence and move on.
+Section 3 — FINANCE: Broader finance and business news — earnings, M&A, corporate strategy, macro trends not already covered above.
+Section 4 — HEALTHCARE: Biotech, pharma, hospital systems, payers, regulation.
+Section 5 — RESTRUCTURING CONSULTING: One <h3> subsection per firm — EY-Parthenon, Alvarez & Marsal, FTI Consulting, AlixPartners. Under each, summarize only what its headlines actually say (a named engagement, a hire, an acquisition, a results note) in 1–3 sentences, with the date. If a firm has no relevant headline, write exactly one sentence: "No notable update in the past few weeks." Do not describe a deal, client, or figure that isn't in that firm's headlines.
 
-Section 1 — WSJ MARKETS: Major market moves reported by the Wall Street Journal — indices, rates, commodities, Fed/central bank signals.
-Section 2 — WSJ 10-POINT: Summarize the newsletter content above in the same story-by-story style (skip stories already covered in Section 1).
-Section 3 — FINANCE: Broader finance and business news of the day — earnings, M&A, corporate strategy, macro trends not already covered above.
-Section 4 — HEALTHCARE: What's happening in the healthcare sector — biotech, pharma, hospital systems, payers, regulation.
-Section 5 — RESTRUCTURING CONSULTING: For EACH of the four firms — EY-Parthenon, Alvarez & Marsal, FTI Consulting, AlixPartners — write its own <h3> subsection naming the firm, followed by 2–3 short paragraphs covering: (a) the specific active deals or engagements in the headlines — who the client/counterparty is, what kind of mandate (restructuring, bankruptcy, M&A advisory, acquisition, senior hire), and any deal size or terms mentioned; (b) what's new or has changed versus what a reader would already know; and (c) why it's a meaningful data point about that firm's positioning (e.g. sector focus, deal flow momentum, competitive standing). If a firm has no usable headlines, write one sentence noting there's no notable update today rather than inventing a deal.
-
-Format strictly as HTML (no <html>/<head>/<body> tags). Use this structure:
+Format strictly as HTML (no <html>/<head>/<body> tags):
 - <h2> for section headers
-- <h3 style="margin-bottom:4px"> for each story headline or firm name (keep it punchy, under 10 words)
+- <h3 style="margin-bottom:4px"> for each story headline or firm name (punchy, under 10 words)
 - <p style="margin-top:4px"> for the analysis paragraph
-- Wrap any key figures/numbers in <strong>
+- Wrap key figures/numbers that came from the source in <strong>
 
 Open with a single <p><em>one-sentence overview of the overall tone of today's news</em></p> before the sections."""
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4500,
+        max_tokens=8000,
+        temperature=0.4,
         messages=[{"role": "user", "content": prompt}],
     )
-    return message.content[0].text
+    return "".join(block.text for block in message.content if block.type == "text")
 
 
 def build_email_html(briefing_content: str, recipient_name: str = "") -> str:
-    today = datetime.now().strftime("%A, %B %d, %Y")
+    today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
     greeting = f"Good morning{', ' + recipient_name if recipient_name else ''}."
 
     return f"""<!DOCTYPE html>
@@ -323,32 +441,37 @@ def main() -> None:
     recipient_email = clean_email(os.environ.get("RECIPIENT_EMAIL", gmail_address))
     recipient_name = os.environ.get("RECIPIENT_NAME", "").strip()
 
-    print("Fetching WSJ market news...")
-    wsj_articles = fetch_from_feeds(WSJ_FEEDS)
+    print("Fetching market / macro news...")
+    market_articles = fetch_from_feeds(MARKET_FEEDS, max_age_days=MARKET_MAX_AGE_DAYS)
 
     print("Fetching WSJ 10-Point newsletter from email...")
     wsj_newsletter_text = fetch_wsj_newsletter(gmail_address, gmail_app_password)
     print("  Found WSJ 10-Point email." if wsj_newsletter_text else "  No WSJ 10-Point email found for today.")
 
     print("Fetching general finance news...")
-    finance_articles = fetch_from_feeds(FINANCE_FEEDS)
+    finance_articles = fetch_from_feeds(FINANCE_FEEDS, max_age_days=MARKET_MAX_AGE_DAYS)
 
     print("Fetching healthcare sector news...")
-    healthcare_articles = fetch_from_feeds(HEALTHCARE_FEEDS)
+    healthcare_articles = fetch_from_feeds(HEALTHCARE_FEEDS, max_age_days=SECTOR_MAX_AGE_DAYS)
 
     print("Fetching restructuring consulting news, per firm...")
     restructuring_by_firm = {firm: fetch_restructuring_articles(firm) for firm in RESTRUCTURING_FIRMS}
+
+    # Keep the same story from showing up in two sections.
+    _dedupe_articles(market_articles, finance_articles, healthcare_articles,
+                     *restructuring_by_firm.values())
+
     for firm, articles in restructuring_by_firm.items():
         print(f"    {firm}: {len(articles)} headlines")
 
     print(
-        f"  WSJ: {len(wsj_articles)}, Finance: {len(finance_articles)}, "
+        f"  Market: {len(market_articles)}, Finance: {len(finance_articles)}, "
         f"Healthcare: {len(healthcare_articles)}, "
         f"Restructuring: {sum(len(a) for a in restructuring_by_firm.values())}"
     )
 
     if not any(
-        [wsj_articles, finance_articles, healthcare_articles, wsj_newsletter_text]
+        [market_articles, finance_articles, healthcare_articles, wsj_newsletter_text]
         + list(restructuring_by_firm.values())
     ):
         raise RuntimeError("No articles fetched — all RSS feeds failed. Check network access.")
@@ -356,10 +479,10 @@ def main() -> None:
     print("Generating briefing with Claude...")
     client = Anthropic(api_key=anthropic_key)
     briefing_content = generate_briefing(
-        client, wsj_articles, wsj_newsletter_text, finance_articles, healthcare_articles, restructuring_by_firm
+        client, market_articles, wsj_newsletter_text, finance_articles, healthcare_articles, restructuring_by_firm
     )
 
-    today_short = datetime.now().strftime("%A, %B %d")
+    today_short = datetime.now(timezone.utc).strftime("%A, %B %d")
     subject = f"Morning Briefing — {today_short}"
     html_email = build_email_html(briefing_content, recipient_name)
 
