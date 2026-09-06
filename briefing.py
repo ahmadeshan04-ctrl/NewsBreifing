@@ -361,7 +361,6 @@ Open with a single <p><em>one-sentence overview of the overall tone of today's n
     message = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=8000,
-        temperature=0.4,
         messages=[{"role": "user", "content": prompt}],
     )
     return "".join(block.text for block in message.content if block.type == "text")
